@@ -4,12 +4,12 @@ module Main(main) where
 
 import           Control.Lens
 import           Data.Maybe                         (catMaybes)
-import           Graphics.Gloss.Data.Color          (Color (..), makeColor)
+import           Graphics.Gloss.Data.Color          (Color (..), makeColor, white)
 import           Graphics.Gloss.Data.Display        (Display (..))
 import           Graphics.Gloss.Data.Picture        (Picture (..), Point (..),
                                                      Vector (..), circleSolid,
                                                      color, pictures, polygon,
-                                                     rotate, translate)
+                                                     rotate, translate, text, scale)
 import           Graphics.Gloss.Data.Vector         (mulSV, unitVectorAtAngle, rotateV)
 import           Graphics.Gloss.Interface.Pure.Game (Event (..), Key (..),
                                                      KeyState (..),
@@ -34,7 +34,9 @@ data Ship = Ship {
         _angular      :: Float,
         _dead         :: Bool,
         _shape        :: [Point],
-        _shots        :: [Shot]
+        _shots        :: [Shot],
+        _last_shoot   :: Float,
+        _shooting     :: Bool
     } deriving (Eq, Show)
 
 makeLenses ''Ship
@@ -51,7 +53,9 @@ makeLenses ''Asteroid
 
 data World = World {
         _ship      :: Ship,
-        _asteroids :: [Asteroid]
+        _asteroids :: [Asteroid],
+        _score     :: Int,
+        _max_score :: Int
     } deriving (Eq, Show)
 
 makeLenses ''World
@@ -86,15 +90,31 @@ initialShip = Ship (0.0, 0.0) (0.0, 0.0) 0.0 0.0 0.0 False [
         (15.0,  -20.0),
         (0.0,   -10.0),
         (-15.0, -20.0)
-    ] []
+    ] [] 10 False
 
 initial :: StdGen -> World
-initial gen = World initialShip $ take (fst $ randomR (4, 8) gen) [makeAsteroid $ mkStdGen g | g <- randoms gen]
+initial gen = World
+    initialShip
+    (take n [makeAsteroid $ mkStdGen g | g <- randoms gen])
+    0
+    n
+    where
+        n :: Int
+        n = (fst $ randomR (4, 8) gen)
 
 draw :: World -> Picture
 draw world = pictures $ (map drawAsteroid $ world ^. asteroids)
     ++ [drawShip $ world ^. ship]
     ++ (map drawShot $ world ^. ship . shots)
+    ++ [scoreView]
+    where
+        scoreView :: Picture
+        scoreView =
+            translate (fromIntegral width/2 - 30) (fromIntegral height/2 - 30)
+            $ Color white
+            $ scale 0.2 0.2
+            $ text
+            $ show (world ^. score)
 
 drawShip :: Ship -> Picture
 drawShip Ship{_position=(x, y), _angle=a, _dead=d, _shape=sh} = translate x y
@@ -158,19 +178,25 @@ getNewSeed w = sum . map floor $ [
         ]) (w ^. asteroids)
 
 update :: Float -> World -> World
-update dt w = (ship %~ updateShip dt (w ^. asteroids))
-    . (asteroids %~ catMaybes . map (updateAsteroid dt (w ^. ship))) $ w
+update dt w =
+    (ship %~ updateShip dt (w ^. asteroids))
+    . (score %~ const (w ^. max_score - length (w ^. asteroids)))
+    . (asteroids %~ catMaybes . map (updateAsteroid dt (w ^. ship)))
+    $ w
 
 updateShip :: Float -> [Asteroid] -> Ship -> Ship
-updateShip dt asts s =  (if s ^. dead
-                            then id
-                            else
-                                (angle      +~ dt * s ^. angular)
-                                . (position %~ inScreen . modifyPosition (s ^. speed) dt)
-                                . (speed    %~ updateSpeed (s ^. angle) (s ^. acceleration)))
-                        . (shots %~ catMaybes . map (updateShot dt))
-                        . (dead  %~ checkCollision s asts)
-                        $ s
+updateShip dt asts s =
+    (if s ^. dead
+        then id
+        else
+            (angle      +~ dt * s ^. angular)
+            . (position %~ inScreen . modifyPosition (s ^. speed) dt)
+            . (speed    %~ updateSpeed (s ^. angle) (s ^. acceleration)))
+    . (shots %~ catMaybes . map (updateShot dt asts))
+    . (dead  %~ checkCollision s asts)
+    . (shooting %~ const False)
+    . (last_shoot %~ \t -> if s ^. shooting then 0 else t + dt)
+    $ s
 
 modifyPosition :: Vector -> Float -> Point -> Point
 modifyPosition (dx, dy) dt = flip translatePoint (dt * dx, dt * dy)
@@ -233,9 +259,11 @@ pointInside (x, y) shape = odd . length . filter check . zip shape $ rotate shap
             | otherwise                                 = False
 
 shoot :: Ship -> Ship
-shoot s = if s ^. dead
+shoot s = if s ^. dead || s ^. last_shoot < 1.0
     then s
-    else shots %~ (newShot :) $ s
+    else  (shooting %~ const True)
+        . (shots %~ (newShot :))
+        $ s
     where
         newShot :: Shot
         newShot = Shot
@@ -243,8 +271,11 @@ shoot s = if s ^. dead
             (mulSV 200.0 . unitVectorAtAngle . toRadians $ s ^. angle)
             2.0
 
-updateShot :: Float -> Shot -> Maybe Shot
-updateShot dt s = if (s ^. time_left) < 0
+updateShot :: Float -> [Asteroid] -> Shot -> Maybe Shot
+updateShot dt asts s = if (s ^. time_left) < 0 || hits
     then Nothing
     else Just $ (s_position %~ inScreen . modifyPosition (s ^. s_speed) dt)
         . (time_left -~ dt) $ s
+    where
+        hits :: Bool
+        hits = any (pointInside $ s ^. s_position) . map getShapeAst $ asts
